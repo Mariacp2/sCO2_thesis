@@ -1,10 +1,8 @@
 from CoolProp.CoolProp import PropsSI
-from scipy import optimize
 import CoolProp as CP
 import os
 import numpy as np
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
 import pandas as pd
 
 # Compute crtical pressure
