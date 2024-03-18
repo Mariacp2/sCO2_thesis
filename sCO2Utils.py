@@ -1,8 +1,10 @@
 from CoolProp.CoolProp import PropsSI
+from scipy import optimize
 import CoolProp as CP
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import pandas as pd
 
 # Compute crtical pressure
@@ -186,3 +188,126 @@ def plot_tvss_phase_transition_region(starting_t, title):
 
   return fig,ax
 
+
+class HeatExchanger:
+  def __init__(
+      self,
+      stream1_entry_state :ThermodynamicState,
+      stream2_entry_state :ThermodynamicState,
+      stream1_mass_flow_rate = 1,
+      stream2_mass_flow_rate = 1,
+      grading = 1,
+      efficiency = .85):
+    """
+    cold_fluid_entry_state (ThermodynamicState) : This is the state of the cold fluid which will be warm up by virtue of heat exchanger
+    warm_fluid_entry_state (ThermodynamicState) : This is the state of the warm fluid which will warm the cold fluid
+    grading (float) : A grading of 1 means the Heat Exchanger is ideal, meaning the maximum amount of heat is transferred and temperatures equalize. A 0 grading means there is no Heat Exchanger at all
+    efficiency (float) : the efficiency dictates how much of the heat of the warm fluid is transferred to the cold fluid, the rest being lost to the environment
+    """
+
+    # The heat exchanger is taken to be the counterflow Heat Exchanger in its simplest form
+    # The grading gives a linear interpolation between the ideal perfect case and the no heat transfer case
+
+    self.stream1_entry_state = stream1_entry_state
+    self.stream1_mass_flow_rate = stream1_mass_flow_rate
+    self.stream2_entry_state = stream2_entry_state
+    self.stream2_mass_flow_rate = stream2_mass_flow_rate
+    self.grading = grading
+    self.efficiency = efficiency 
+  
+  def heat_exchanged(self, T_eq):
+
+    # Starting T1 = self.stream1_entry_state.t
+    # We need to define the integration spacing
+    # Break up T_eq - T1 into 10 pieces
+    N = 10
+    t1_space = np.linspace(self.stream1_entry_state.t, T_eq, N)
+    cp1_avg = np.mean(np.array(PropsSI('CPMOLAR','P',self.stream1_entry_state.p,'T',t1_space,'CO2'))/44.01) # TO CONVERT IT TO KJ/kgK
+    delta_Q1 = cp1_avg*(T_eq - self.stream1_entry_state.t)*self.stream1_mass_flow_rate
+
+    # Starting T2 = self.stream2_entry_state.t
+    # We need to define the integration spacing
+    # Break up T_eq - T2 into 10 pieces
+    t2_space = np.linspace(self.stream2_entry_state.t, T_eq, N)
+    
+    if self.stream2_entry_state.p < pc:
+        # Make sure to avoid discontinuity at Ts
+        # At the same time, avoid discontinuity if and only if p < p_crit, meaning CO2 can undergo a phase transition
+        Ts = PropsSI('T','P',self.stream2_entry_state.p,'Q',0,'CO2')
+        # If t2_space has a value that is too close to Ts it will raise an error into PropsSI when computing CPMOLAR
+        # Thus we change those values to something that does not raise errors
+        t2_space[(t2_space > Ts*.999)&(t2_space<Ts*1.001)] = Ts*1.001
+        # Discontinuity avoided
+    
+    cp2_avg = np.mean(np.array(PropsSI('CPMOLAR','P',self.stream2_entry_state.p,'T',t2_space,'CO2'))/44.01) # TO CONVERT IT TO KJ/kgK
+    delta_Q2 = cp2_avg*(T_eq - self.stream2_entry_state.t)*self.stream2_mass_flow_rate
+
+    return delta_Q2 + delta_Q1
+
+
+  def find_equilibrium_temperature(self):
+
+    sol = optimize.root_scalar(self.heat_exchanged, bracket=[self.stream1_entry_state.t, self.stream2_entry_state.t])
+    
+    return sol.root
+
+  def resolve_exit_states(self):
+    """
+    This function takes in all input state parameters and outputs the final states based on the grading and efficiency of the Heat Exchanger
+    Returns 
+    output_state : The output states of the Heat Exchanger, first the cold fluid exit state followed by warm fluid exit state
+
+    """
+
+    t_eq = self.find_equilibrium_temperature()
+    
+    # We need to know which stream is warmer at the start
+    if self.stream1_entry_state.t > self.stream2_entry_state.t:
+      warm_entry_state,cold_entry_state = self.stream1_entry_state,self.stream2_entry_state
+      warm_mass_flow_rate, cold_mass_flow_rate = self.stream1_mass_flow_rate, self.stream2_mass_flow_rate
+    else:
+      warm_entry_state,cold_entry_state = self.stream2_entry_state,self.stream1_entry_state
+      warm_mass_flow_rate, cold_mass_flow_rate = self.stream2_mass_flow_rate, self.stream1_mass_flow_rate
+
+
+    ideal_warm_exit_state = ThermodynamicState(
+        p = warm_entry_state.p,
+        t = t_eq,
+    )
+    
+    ideal_warm_exit_state.compute_from_p_t()
+
+    # The ideal heat exchanged is
+    ideal_delta_Q = warm_mass_flow_rate*(ideal_warm_exit_state.h - warm_entry_state.h)
+
+    # The heat exchanged is based on grading and efficiency
+    actual_delta_Q = ideal_delta_Q*self.grading*self.efficiency
+
+    # The actual enthalpy change is thus
+    actual_enthalpy_change = actual_delta_Q/warm_mass_flow_rate
+
+    #The actual exit state of the warm stream is thus
+    warm_exit_state = ThermodynamicState(
+        p = warm_entry_state.p,
+        h = warm_entry_state.h + actual_enthalpy_change,
+    )
+
+    warm_exit_state.compute_from_p_h()
+
+    delta_Q_2 = actual_delta_Q
+
+    enthalpy_change_2 = delta_Q_2/cold_mass_flow_rate # Keep in mind this enthalpy change is negative
+
+    cold_exit_state = ThermodynamicState(
+      p = cold_entry_state.p,
+      h = cold_entry_state.h - enthalpy_change_2,
+    )
+
+    cold_exit_state.compute_from_p_h()
+
+    if self.stream1_entry_state.t > self.stream2_entry_state.t:
+      stream1_exit_state,stream2_exit_state = warm_exit_state, cold_exit_state      
+    else:
+      stream2_exit_state,stream1_exit_state = warm_exit_state, cold_exit_state      
+      
+    return stream1_exit_state, stream2_exit_state
